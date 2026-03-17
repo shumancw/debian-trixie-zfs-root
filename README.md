@@ -1,5 +1,5 @@
-# debian-buster-zfs-root
-Installs Debian GNU/Linux 10 Buster to a native ZFS root filesystem using a [Debian Live CD](https://www.debian.org/CD/live/). The resulting system is a fully updateable debian system with no quirks or workarounds.
+# debian-trixie-zfs-root
+Installs Debian GNU/Linux 13 Trixie to a native ZFS root filesystem using a [Debian Live CD](https://www.debian.org/CD/live/). The resulting system is a fully updateable debian system with no quirks or workarounds.
 
 ## Warning
 This was forked, then sent to Gemini for updating to trixie. I haven't even tested the script yet! You've been warned.
