@@ -1,31 +1,21 @@
 #!/bin/bash
 set -e
 
-# --- USER CONFIG ---
+# --- CONFIGURATION (Adjust as needed) ---
 NEW_USER="admin"
 NEW_HOSTNAME="debian-zfs"
-ZPOOL_NAME="rpool"
 TARGET_DIST="trixie"
 
-### 1. Nuclear APT Fix & Dependencies
-echo "Step 1: Fixing APT and installing ZFS..."
-rm -rf /etc/apt/sources.list /etc/apt/sources.list.d/*
-cat << EOF > /etc/apt/sources.list
-deb http://deb.debian.org/debian/ $TARGET_DIST main contrib non-free non-free-firmware
-deb http://deb.debian.org/debian/ $TARGET_DIST-updates main contrib non-free non-free-firmware
-deb http://security.debian.org/debian-security $TARGET_DIST-security main contrib non-free non-free-firmware
-EOF
+### 1. Prepare Environment [cite: 432]
+echo "Step 1: Setting up repositories and installing ZFS..."
+rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*
+echo "deb http://deb.debian.org/debian $TARGET_DIST main contrib non-free-firmware" > /etc/apt/sources.list [cite: 437]
+apt update [cite: 438]
+apt install --yes debootstrap gdisk zfsutils-linux linux-headers-generic [cite: 451, 453]
+modprobe zfs
 
-apt-get update
-apt-get install -y zfsutils-linux gdisk debootstrap dosfstools sudo network-manager
-
-modprobe zfs || { 
-    echo "Live kernel mismatch detected. Building ZFS module via DKMS..."
-    apt-get install -y linux-headers-$(uname -r) zfs-dkms
-    modprobe zfs
-}
-
-### 2. Universal Disk Selection
+### 2. Disk Selection
+# (Using the same interactive selector from before for convenience)
 declare -A BYID
 SELECT=()
 for dev in /dev/disk/by-id/*; do
@@ -39,96 +29,96 @@ for dev in /dev/disk/by-id/*; do
         SELECT+=("$REAL" "$dev ($SIZE)" off)
     fi
 done
-
 TMPFILE=$(mktemp)
 trap 'rm -f "$TMPFILE"' EXIT
 whiptail --title "ZFS Drive Selection" --separate-output \
-    --checklist "Select disks (NVMe/SATA/VirtIO):" 20 78 10 "${SELECT[@]}" 2>"$TMPFILE" || exit 1
-
+    --checklist "Select disks:" 20 78 10 "${SELECT[@]}" 2>"$TMPFILE" || exit 1
 DISKS=()
 while read -r D; do DISKS+=("${BYID[$D]}"); done < "$TMPFILE"
-[ ${#DISKS[@]} -eq 0 ] && exit 1
 
-### 3. Aligned Partitioning
-echo "Step 3: Creating Aligned Partitions..."
+### 3. Disk Formatting [cite: 454]
+echo "Step 3: Partitioning disks..."
 for D in "${DISKS[@]}"; do
-    sgdisk --zap-all "$D"
-    sgdisk --clear "$D"
-    sgdisk -n 1:0:+1M    -t 1:EF02 -c 1:"BIOSBoot" "$D"
-    sgdisk -n 2:0:+512M  -t 2:EF00 -c 2:"EFI" "$D"
-    sgdisk -n 3:0:0      -t 3:BF01 -c 3:"ZFS" "$D"
+    sgdisk --zap-all "$D" [cite: 484]
+    # Partition 1: BIOS Boot [cite: 490]
+    sgdisk -a1 -n1:24K:+1000K -t1:EF02 "$D"
+    # Partition 2: EFI [cite: 493]
+    sgdisk -n2:1M:+512M -t2:EF00 "$D"
+    # Partition 3: Boot Pool [cite: 497]
+    sgdisk -n3:0:+1G -t3:BF01 "$D"
+    # Partition 4: Root Pool [cite: 502]
+    sgdisk -n4:0:0 -t4:BF00 "$D"
 done
-udevadm settle
-sleep 2
+udevadm settle && sleep 2
 
-### 4. Pool Creation & Dataset Fix
-echo "Step 4: Creating Pool and Datasets..."
-ZFS_PARTS=()
-for D in "${DISKS[@]}"; do
-    PART=$(ls "${D}"* | grep -E "(-part3|p3)$" | head -n1)
-    ZFS_PARTS+=("$PART")
-done
+### 4. Pool & Dataset Creation [cite: 509, 534]
+echo "Step 4: Creating pools and datasets..."
+# Boot Pool (bpool) - Restricted features for GRUB [cite: 522]
+zpool create -o ashift=12 -o autotrim=on -o compatibility=grub2 \
+    -O devices=off -O acltype=posixacl -O xattr=sa -O compression=lz4 \
+    -O normalization=formD -O relatime=on -O canmount=off \
+    -O mountpoint=/boot -R /mnt bpool "${DISKS[@]/%/-part3}" [cite: 510-520]
 
-# Create pool with altroot
-zpool create -f -o ashift=12 -o altroot=/target \
-    -O compression=lz4 -O acltype=posixacl -O xattr=sa -O relatime=on \
-    -O normalization=formD -O mountpoint=none "$ZPOOL_NAME" "${ZFS_PARTS[@]}"
+# Root Pool (rpool) [cite: 537]
+zpool create -f -o ashift=12 -o autotrim=on \
+    -O acltype=posixacl -O xattr=sa -O dnodesize=auto -O compression=lz4 \
+    -O normalization=formD -O relatime=on -O canmount=off \
+    -O mountpoint=/ -R /mnt rpool "${DISKS[@]/%/-part4}" [cite: 538-544]
 
-# Create root dataset
-zfs create -o mountpoint=/ "$ZPOOL_NAME/ROOT"
-zpool set bootfs="$ZPOOL_NAME/ROOT" "$ZPOOL_NAME"
+# Create container datasets [cite: 603]
+zfs create -o canmount=off -o mountpoint=none rpool/ROOT [cite: 604]
+zfs create -o canmount=off -o mountpoint=none bpool/BOOT [cite: 605]
 
-# FORCED MOUNT: This bypasses the error you saw
-zfs mount -a || true
-if [ ! -d "/target/etc" ]; then mkdir -p /target; fi
-mount -t zfs "$ZPOOL_NAME/ROOT" /target 2>/dev/null || true
+# Create system datasets [cite: 610, 612]
+zfs create -o canmount=noauto -o mountpoint=/ rpool/ROOT/debian [cite: 611]
+zfs mount rpool/ROOT/debian [cite: 611]
+zfs create -o mountpoint=/boot bpool/BOOT/debian [cite: 612]
 
-### 5. Debootstrap
-echo "Step 5: Installing Base System..."
-debootstrap --include=zfs-initramfs,zfsutils-linux,linux-image-amd64,grub-efi-amd64,network-manager,sudo,nano \
-    --components main,contrib,non-free,non-free-firmware "$TARGET_DIST" /target http://deb.debian.org/debian/
+# Optional datasets for better snapshot management [cite: 615, 629]
+zfs create rpool/home
+zfs create -o mountpoint=/root rpool/home/root [cite: 618]
+zfs create -o canmount=off rpool/var [cite: 620]
+zfs create rpool/var/log [cite: 625]
+zfs create rpool/var/spool [cite: 627]
 
-echo "$NEW_HOSTNAME" > /target/etc/hostname
-cp /etc/resolv.conf /target/etc/resolv.conf
-cp /etc/hostid /target/etc/hostid
+### 5. System Installation [cite: 602]
+echo "Step 5: Installing Debian $TARGET_DIST..."
+debootstrap "$TARGET_DIST" /mnt [cite: 634]
+cp /etc/zfs/zpool.cache /mnt/etc/zfs/ [cite: 636]
+echo "$NEW_HOSTNAME" > /mnt/etc/hostname
 
-IFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -v 'lo' | head -n1)
-cat << EOF > /target/etc/network/interfaces
-auto lo
-iface lo inet loopback
-allow-hotplug $IFACE
-iface $IFACE inet dhcp
+### 6. System Configuration [cite: 380]
+# Bind filesystems and chroot [cite: 641]
+mount --make-private --rbind /dev  /mnt/dev
+mount --make-private --rbind /proc /mnt/proc
+mount --make-private --rbind /sys  /mnt/sys
+
+chroot /mnt bash --login <<EOF
+apt update
+apt install --yes console-setup locales [cite: 642]
+apt install --yes dpkg-dev linux-headers-generic linux-image-generic zfs-initramfs [cite: 643]
+echo REMAKE_INITRD=yes > /etc/dkms/zfs.conf [cite: 643]
+
+# GRUB Setup [cite: 647, 674]
+apt install --yes dosfstools grub-efi-amd64 shim-signed [cite: 648]
+mkdosfs -F 32 -s 1 -n EFI ${DISKS[0]}-part2 [cite: 648]
+mkdir -p /boot/efi
+mount ${DISKS[0]}-part2 /boot/efi
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=debian --recheck --no-floppy [cite: 674]
+
+# GRUB ZFS Fix [cite: 669]
+sed -i 's|GRUB_CMDLINE_LINUX=""|GRUB_CMDLINE_LINUX="root=ZFS=rpool/ROOT/debian"|' /etc/default/grub
+update-grub [cite: 671]
+
+# User setup [cite: 690]
+useradd -m -s /bin/bash $NEW_USER
+usermod -a -G sudo $NEW_USER
 EOF
 
-### 6. Chroot Configuration
-for i in /dev /dev/pts /proc /sys /run; do mount --bind "$i" "/target$i"; done
+echo "Done. Set passwords below."
+chroot /mnt passwd root [cite: 652]
+chroot /mnt passwd $NEW_USER
 
-chroot /target bash -c "
-useradd -m -s /bin/bash $NEW_USER
-echo '$NEW_USER ALL=(ALL) ALL' > /etc/sudoers.d/$NEW_USER
-chmod 0440 /etc/sudoers.d/$NEW_USER
-echo 'zfs_import_dir=\"/dev/disk/by-id\"' >> /etc/default/zfs
-update-initramfs -u -k all
-update-grub
-"
-
-### 7. Multi-Disk EFI Install
-for D in "${DISKS[@]}"; do
-    EFIPART=$(ls "${D}"* | grep -E "(-part2|p2)$" | head -n1)
-    mkdosfs -F 32 "$EFIPART"
-    mkdir -p /target/boot/efi
-    mount "$EFIPART" /target/boot/efi
-    chroot /target grub-install --target=x86_64-efi --efi-directory=/boot/efi --recheck
-    umount /target/boot/efi
-done
-
-echo "------------------------------------------------"
-echo "INSTALL SUCCESSFUL!"
-echo "Set password for $NEW_USER:"
-chroot /target passwd "$NEW_USER"
-echo "Set password for ROOT:"
-chroot /target passwd root
-echo "------------------------------------------------"
-
-sync
-echo "Done. You can now reboot."
+### 7. Cleanup [cite: 385, 684]
+zpool export -a [cite: 686]
+echo "Installation Finished. Reboot and enjoy your ZFS-root system!"
