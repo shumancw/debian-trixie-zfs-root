@@ -5,6 +5,13 @@
 # Exit on error, but we'll handle whiptail exits manually for better UX
 set -e
 
+### 0. Update Live CD Sources
+echo "deb http://deb.debian.org/debian/ $TARGETDIST main contrib non-free non-free-firmware" > /etc/apt/sources.list
+echo "deb http://deb.debian.org/debian/ $TARGETDIST-updates main contrib non-free non-free-firmware" >> /etc/apt/sources.list
+echo "deb http://security.debian.org/debian-security $TARGETDIST-security main contrib non-free non-free-firmware" >> /etc/apt/sources.list
+
+apt-get update
+
 ### Static settings
 ZPOOL="${TARGET_ZPOOL:-rpool}"
 TARGETDIST="trixie"
