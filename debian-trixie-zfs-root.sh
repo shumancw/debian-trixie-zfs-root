@@ -1,30 +1,42 @@
 #!/bin/bash
-# debian-trixie-zfs-root.sh (Revision 3 - 2026 Stable)
 set -e
 
-### 0. Fix Repositories (DEB822 Support)
-echo "Configuring repositories for Debian 13 (Trixie)..."
-if [ -f /etc/apt/sources.list.d/debian.sources ]; then
-    sed -i 's/Components: main/Components: main contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources
-else
-    # Fallback for older ISOs using legacy format
-    sed -i 's/main$/main contrib non-free non-free-firmware/' /etc/apt/sources.list
-fi
+### 0. Force Repositories & Clear APT Locks
+echo "Cleaning APT and forcing Trixie repositories..."
+rm -f /var/lib/dpkg/lock* /var/lib/apt/lists/lock*
+rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*.sources
 
+# Create a clean DEB822 source file
+cat << EOF > /etc/apt/sources.list.d/debian.sources
+Types: deb
+URIs: http://deb.debian.org/debian
+Suites: trixie trixie-updates
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb
+URIs: http://security.debian.org/debian-security
+Suites: trixie-security
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+EOF
+
+apt-get clean
 apt-get update
 
-### 1. Preparation & Kernel Check
-echo "Installing dependencies..."
-apt-get install -y zfsutils-linux gdisk dosfstools debootstrap
+### 1. Install ZFS Tools
+echo "Installing ZFS tools..."
+# If this fails, the Live CD has no internet or the mirrors are down
+apt-get install -y zfsutils-linux gdisk debootstrap dosfstools
 
-# Check if ZFS module can load; if not, compile it for the Live Kernel
-if ! modprobe zfs; then
-    echo "Standard ZFS module failed to load. Attempting DKMS build for current kernel..."
+# Load ZFS module or build if necessary
+modprobe zfs || { 
+    echo "Module not found, attempting DKMS build..."
     apt-get install -y linux-headers-$(uname -r) zfs-dkms
     modprobe zfs
-fi
+}
 
-### 2. Identify Disks
+### 2. Disk Selection
 declare -A BYID
 SELECT=()
 for dev in /dev/disk/by-id/*; do
@@ -40,60 +52,48 @@ done
 
 TMPFILE=$(mktemp)
 trap 'rm -f "$TMPFILE"' EXIT
-
-whiptail --title "Drive selection" --separate-output \
-    --checklist "Select drives for the ZFS pool:" 20 78 10 "${SELECT[@]}" 2>"$TMPFILE" || exit 1
+whiptail --title "Disk Selection" --separate-output --checklist "Select Disks for ZFS Pool" 20 75 10 "${SELECT[@]}" 2>"$TMPFILE" || exit 1
 
 DISKS=()
-ZFSPARTITIONS=()
-EFIPARTITIONS=()
-while read -r DISK; do
-    ID_PATH="${BYID[$DISK]}"
-    DISKS+=("$ID_PATH")
-    ZFSPARTITIONS+=("${ID_PATH}-part3")
-    EFIPARTITIONS+=("${ID_PATH}-part2")
-done < "$TMPFILE"
+while read -r D; do DISKS+=("${BYID[$D]}"); done < "$TMPFILE"
+[ ${#DISKS[@]} -eq 0 ] && exit 1
 
-[ ${#DISKS[@]} -eq 0 ] && { echo "No disks selected."; exit 1; }
-
-### 3. RAID Level
-whiptail --title "RAID Level" --separate-output \
-    --radiolist "Select ZFS RAID level" 20 74 8 \
-    "SINGLE" "Stripe (1+ disks)" on \
-    "MIRROR" "Mirror (2, 4, 6 disks)" off \
-    "RAIDZ1" "RAIDZ1 (3+ disks)" off 2>"$TMPFILE" || exit 1
-
-RAIDTYPE=$(cat "$TMPFILE")
-RAIDDEF=""
-case "$RAIDTYPE" in
-    SINGLE) RAIDDEF="${ZFSPARTITIONS[*]}" ;;
-    MIRROR) 
-        for ((i=0; i<${#ZFSPARTITIONS[@]}; i+=2)); do RAIDDEF+=" mirror ${ZFSPARTITIONS[i]} ${ZFSPARTITIONS[i+1]}"; done ;;
-    RAIDZ1) RAIDDEF="raidz1 ${ZFSPARTITIONS[*]}" ;;
-esac
-
-### 4. Partition & Pool
+### 3. Partitioning & Pool
 ZPOOL="rpool"
-for DISK in "${DISKS[@]}"; do
-    sgdisk --zap-all "$DISK"
-    sgdisk -n 1:34:2047 -t 1:EF02 -n 2:2048:+512M -t 2:EF00 -n 3:0:0 -t 3:BF01 "$DISK"
+for D in "${DISKS[@]}"; do
+    sgdisk --zap-all "$D"
+    sgdisk -n 1:34:2047 -t 1:EF02 -n 2:2048:+512M -t 2:EF00 -n 3:0:0 -t 3:BF01 "$D"
 done
 udevadm settle
 
-zpool create -f -o ashift=12 -o altroot=/target -o autotrim=on \
-    -O normalization=formD -O relatime=on -O xattr=sa -O acltype=posixacl \
-    -O canmount=off -O mountpoint=none "$ZPOOL" $RAIDDEF
+# Create Pool (Using -part3 for ZFS)
+zpool create -f -o ashift=12 -o altroot=/target -O compression=lz4 -O mountpoint=none "$ZPOOL" "${DISKS[@]/%/-part3}"
+zfs create -o mountpoint=/ "$ZPOOL/ROOT"
+zpool set bootfs="$ZPOOL/ROOT" "$ZPOOL"
+mount -t zfs "$ZPOOL/ROOT" /target
 
-zfs create "$ZPOOL/ROOT"
-zfs create -o mountpoint=/ "$ZPOOL/ROOT/debian-trixie"
-zpool set bootfs="$ZPOOL/ROOT/debian-trixie" "$ZPOOL"
+### 4. Bootstrap
+debootstrap --include=zfs-initramfs,zfsutils-linux,linux-image-amd64,grub-efi-amd64,network-manager,dhcpcd8 trixie /target http://deb.debian.org/debian/
 
-# Mount & Bootstrap
-mount -t zfs "$ZPOOL/ROOT/debian-trixie" /target
-debootstrap --include=zfs-initramfs,zfsutils-linux,linux-image-amd64,grub-efi-amd64 \
-    --components main,contrib,non-free,non-free-firmware trixie /target http://deb.debian.org/debian/
+### 5. Network Configuration
+echo "Configuring Network..."
+# Set Hostname
+echo "${TARGET_HOSTNAME:-debian-zfs}" > /target/etc/hostname
 
-# Finalize
+# Copy DNS from Live Environment
+[ -f /etc/resolv.conf ] && cp /etc/resolv.conf /target/etc/resolv.conf
+
+# Setup simple DHCP for all interfaces (Debian 13 style)
+cat << EOF > /target/etc/network/interfaces
+auto lo
+iface lo inet loopback
+
+# Primary interface (Dynamic)
+allow-hotplug $(ip -o link show | awk -F': ' '{print $2}' | grep -v 'lo' | head -n1)
+iface $(ip -o link show | awk -F': ' '{print $2}' | grep -v 'lo' | head -n1) inet dhcp
+EOF
+
+### 6. System Finalization
 for i in /dev /dev/pts /proc /sys /run; do mount --bind "$i" "/target$i"; done
 cp /etc/hostid /target/etc/hostid
 
@@ -102,13 +102,18 @@ update-initramfs -u -k all
 update-grub
 "
 
-# Install GRUB to EFI
-for EFIPART in "${EFIPARTITIONS[@]}"; do
+# Install GRUB to all selected disks
+for D in "${DISKS[@]}"; do
+    EFIPART="${D}-part2"
     mkdosfs -F 32 "$EFIPART"
+    mkdir -p /target/boot/efi
     mount "$EFIPART" /target/boot/efi
     chroot /target grub-install --target=x86_64-efi --efi-directory=/boot/efi --recheck
     umount /target/boot/efi
 done
 
-echo "Success. Set root password:"
+echo "SUCCESS. Set the root password now:"
 chroot /target passwd
+
+sync
+echo "Done. You can now reboot into your new ZFS system."
