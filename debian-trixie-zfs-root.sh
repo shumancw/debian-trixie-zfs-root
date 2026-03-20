@@ -1,21 +1,20 @@
 #!/bin/bash
 set -e
 
-# --- CONFIGURATION (Adjust as needed) ---
+# --- CONFIGURATION ---
 NEW_USER="admin"
 NEW_HOSTNAME="debian-zfs"
 TARGET_DIST="trixie"
 
-### 1. Prepare Environment [cite: 432]
+### 1. Prepare Environment
 echo "Step 1: Setting up repositories and installing ZFS..."
 rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*
-echo "deb http://deb.debian.org/debian $TARGET_DIST main contrib non-free-firmware" > /etc/apt/sources.list [cite: 437]
-apt update [cite: 438]
-apt install --yes debootstrap gdisk zfsutils-linux linux-headers-generic [cite: 451, 453]
+echo "deb http://deb.debian.org/debian $TARGET_DIST main contrib non-free-firmware" > /etc/apt/sources.list
+apt update
+apt install --yes debootstrap gdisk zfsutils-linux linux-headers-generic
 modprobe zfs
 
 ### 2. Disk Selection
-# (Using the same interactive selector from before for convenience)
 declare -A BYID
 SELECT=()
 for dev in /dev/disk/by-id/*; do
@@ -36,89 +35,92 @@ whiptail --title "ZFS Drive Selection" --separate-output \
 DISKS=()
 while read -r D; do DISKS+=("${BYID[$D]}"); done < "$TMPFILE"
 
-### 3. Disk Formatting [cite: 454]
+### 3. Disk Formatting (Official Alignment)
 echo "Step 3: Partitioning disks..."
 for D in "${DISKS[@]}"; do
-    sgdisk --zap-all "$D" [cite: 484]
-    # Partition 1: BIOS Boot [cite: 490]
+    sgdisk --zap-all "$D"
     sgdisk -a1 -n1:24K:+1000K -t1:EF02 "$D"
-    # Partition 2: EFI [cite: 493]
     sgdisk -n2:1M:+512M -t2:EF00 "$D"
-    # Partition 3: Boot Pool [cite: 497]
     sgdisk -n3:0:+1G -t3:BF01 "$D"
-    # Partition 4: Root Pool [cite: 502]
     sgdisk -n4:0:0 -t4:BF00 "$D"
 done
 udevadm settle && sleep 2
 
-### 4. Pool & Dataset Creation [cite: 509, 534]
+### 4. Pool & Dataset Creation
 echo "Step 4: Creating pools and datasets..."
-# Boot Pool (bpool) - Restricted features for GRUB [cite: 522]
 zpool create -o ashift=12 -o autotrim=on -o compatibility=grub2 \
     -O devices=off -O acltype=posixacl -O xattr=sa -O compression=lz4 \
     -O normalization=formD -O relatime=on -O canmount=off \
-    -O mountpoint=/boot -R /mnt bpool "${DISKS[@]/%/-part3}" [cite: 510-520]
+    -O mountpoint=/boot -R /mnt bpool "${DISKS[@]/%/-part3}"
 
-# Root Pool (rpool) [cite: 537]
 zpool create -f -o ashift=12 -o autotrim=on \
     -O acltype=posixacl -O xattr=sa -O dnodesize=auto -O compression=lz4 \
     -O normalization=formD -O relatime=on -O canmount=off \
-    -O mountpoint=/ -R /mnt rpool "${DISKS[@]/%/-part4}" [cite: 538-544]
+    -O mountpoint=/ -R /mnt rpool "${DISKS[@]/%/-part4}"
 
-# Create container datasets [cite: 603]
-zfs create -o canmount=off -o mountpoint=none rpool/ROOT [cite: 604]
-zfs create -o canmount=off -o mountpoint=none bpool/BOOT [cite: 605]
+zfs create -o canmount=off -o mountpoint=none rpool/ROOT
+zfs create -o canmount=off -o mountpoint=none bpool/BOOT
+zfs create -o canmount=noauto -o mountpoint=/ rpool/ROOT/debian
+zfs mount rpool/ROOT/debian
+zfs create -o mountpoint=/boot bpool/BOOT/debian
 
-# Create system datasets [cite: 610, 612]
-zfs create -o canmount=noauto -o mountpoint=/ rpool/ROOT/debian [cite: 611]
-zfs mount rpool/ROOT/debian [cite: 611]
-zfs create -o mountpoint=/boot bpool/BOOT/debian [cite: 612]
-
-# Optional datasets for better snapshot management [cite: 615, 629]
+# Essential System Paths
 zfs create rpool/home
-zfs create -o mountpoint=/root rpool/home/root [cite: 618]
-zfs create -o canmount=off rpool/var [cite: 620]
-zfs create rpool/var/log [cite: 625]
-zfs create rpool/var/spool [cite: 627]
+zfs create -o mountpoint=/root rpool/home/root
+zfs create -o canmount=off rpool/var
+zfs create rpool/var/log
+zfs create rpool/var/spool
+zfs create rpool/var/cache
 
-### 5. System Installation [cite: 602]
-echo "Step 5: Installing Debian $TARGET_DIST..."
-debootstrap "$TARGET_DIST" /mnt [cite: 634]
-cp /etc/zfs/zpool.cache /mnt/etc/zfs/ [cite: 636]
+### 5. System Installation
+echo "Step 5: Bootstrapping base system + SSH..."
+# Including 'standard' priority packages and 'openssh-server'
+debootstrap --include=openssh-server,unattended-upgrades,apt-listchanges trixie /mnt
+
+cp /etc/zfs/zpool.cache /mnt/etc/zfs/
 echo "$NEW_HOSTNAME" > /mnt/etc/hostname
+cp /etc/resolv.conf /mnt/etc/resolv.conf
 
-### 6. System Configuration [cite: 380]
-# Bind filesystems and chroot [cite: 641]
+### 6. System Configuration (Chroot)
 mount --make-private --rbind /dev  /mnt/dev
 mount --make-private --rbind /proc /mnt/proc
 mount --make-private --rbind /sys  /mnt/sys
 
 chroot /mnt bash --login <<EOF
 apt update
-apt install --yes console-setup locales [cite: 642]
-apt install --yes dpkg-dev linux-headers-generic linux-image-generic zfs-initramfs [cite: 643]
-echo REMAKE_INITRD=yes > /etc/dkms/zfs.conf [cite: 643]
+apt install --yes console-setup locales standard-fast-track
+apt install --yes linux-headers-generic linux-image-generic zfs-initramfs
 
-# GRUB Setup [cite: 647, 674]
-apt install --yes dosfstools grub-efi-amd64 shim-signed [cite: 648]
-mkdosfs -F 32 -s 1 -n EFI ${DISKS[0]}-part2 [cite: 648]
+# GRUB & EFI
+apt install --yes dosfstools grub-efi-amd64 shim-signed
+mkdosfs -F 32 -s 1 -n EFI ${DISKS[0]}-part2
 mkdir -p /boot/efi
 mount ${DISKS[0]}-part2 /boot/efi
-grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=debian --recheck --no-floppy [cite: 674]
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=debian --recheck --no-floppy
 
-# GRUB ZFS Fix [cite: 669]
+# Fix ZFS Boot
+echo 'REMAKE_INITRD=yes' > /etc/dkms/zfs.conf
 sed -i 's|GRUB_CMDLINE_LINUX=""|GRUB_CMDLINE_LINUX="root=ZFS=rpool/ROOT/debian"|' /etc/default/grub
-update-grub [cite: 671]
+update-grub
 
-# User setup [cite: 690]
+# Setup Automated Updates
+cat <<EOP > /etc/apt/apt.conf.d/20auto-upgrades
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOP
+
+# User setup
 useradd -m -s /bin/bash $NEW_USER
-usermod -a -G sudo $NEW_USER
+usermod -a -G sudo,netdev $NEW_USER
 EOF
 
-echo "Done. Set passwords below."
-chroot /mnt passwd root [cite: 652]
+echo "------------------------------------------------"
+echo "Set password for $NEW_USER:"
 chroot /mnt passwd $NEW_USER
+echo "Set password for ROOT:"
+chroot /mnt passwd root
+echo "------------------------------------------------"
 
-### 7. Cleanup [cite: 385, 684]
-zpool export -a [cite: 686]
-echo "Installation Finished. Reboot and enjoy your ZFS-root system!"
+### 7. Cleanup
+zpool export -a
+echo "Done! Reboot now."
